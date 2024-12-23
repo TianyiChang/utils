@@ -2,6 +2,8 @@
 
 import os
 import re
+import uuid
+import csv
 import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -11,9 +13,48 @@ from tqdm import tqdm
 from log_utils import setup_logging, log_message
 import logging
 
+def generate_file_unicode_mapping(input_files):
+    """
+    Generate unique identifiers for input files.
+    
+    Args:
+        input_files (list): List of input file paths
+    
+    Returns:
+        list: List of dictionaries with 'unicode' and 'path' keys
+    """
+    file_unicode_mappings = []
+    for file_path in input_files:
+        file_unicode_mappings.append({
+            'unicode': str(uuid.uuid4()),
+            'path': str(file_path)
+        })
+    return file_unicode_mappings
+
+def add_unicode_to_fasta_headers(content, unicode_mapping):
+    """
+    Add unicode to fasta headers at the beginning.
+    
+    Args:
+        content (str): Fasta file content
+        unicode_mapping (str): Unicode to add to headers
+    
+    Returns:
+        str: Modified fasta content with unicodes at the beginning of headers
+    """
+    lines = content.split('\n')
+    modified_lines = []
+    for line in lines:
+        if line.startswith('>'):
+            # Remove the '>' and add unicode at the beginning
+            header = line[1:]
+            line = f">{unicode_mapping}_unicode_{header}"
+        modified_lines.append(line)
+    return '\n'.join(modified_lines)
+    
 def find_fasta_files(input_paths):
     """
-    Find all FASTA files in the given input paths.
+    Find all FASTA files in the given input paths using concurrent processing.
     
     Args:
         input_paths (list): List of paths to search for FASTA files
@@ -21,16 +62,31 @@ def find_fasta_files(input_paths):
     Returns:
         list: List of paths to FASTA files
     """
-    fasta_files = []
-    for path in input_paths:
+    
+    def find_files_in_path(path):
+        path_str = str(path)
+        # Handle wildcard paths
+        if '*' in path_str:
+            matching_files = list(Path(path_str.rsplit('*', 1)[0]).glob(path_str.split('*')[-1]))
+            return [f for f in matching_files if f.suffix in ['.fa', '.fasta', '.faa', '.fas', '.fna']]
+        
         path_obj = Path(path)
         if path_obj.is_dir():
-            fasta_files.extend(list(path_obj.rglob('*.fa*')) + 
-                               list(path_obj.rglob('*.fna')))
-        elif path_obj.is_file() and path_obj.suffix in ['.fa*', '.fna']:
-            fasta_files.append(path_obj)
+            return list(path_obj.rglob('*.fa*')) + list(path_obj.rglob('*.fna'))
+        elif path_obj.is_file() and path_obj.suffix in ['.fa', '.fasta', '.faa', '.fas', '.fna']:
+            return [path_obj]
+        return []
+
+    with ThreadPoolExecutor() as executor:
+        # Submit search tasks for each input path
+        futures = {executor.submit(find_files_in_path, path): path for path in input_paths}
+        
+        # Collect results
+        fasta_files = []
+        for future in as_completed(futures):
+            fasta_files.extend(future.result())
     
-    return fasta_files
+    return list(set(fasta_files))  # Remove duplicates
 
 def read_fasta_file(file_path):
     """Read the contents of a fasta file."""
@@ -75,7 +131,8 @@ def clean_fasta(input_file, output_file):
     chunk_size = 100_000
     chunks = chunk_fasta_content(content, chunk_size)
 
-    with ProcessPoolExecutor(max_workers=os.cpu_count() * 2) as executor:
+    max_workers = os.cpu_count() or 1  # Default to 1 if None
+    with ProcessPoolExecutor(max_workers=max_workers * 2) as executor:
         cleaned_chunks = list(executor.map(clean_fasta_chunk, chunks))
 
     with open(output_file, 'w') as outfile:
@@ -88,8 +145,9 @@ def main():
     parser.add_argument('output_file', help='The path to the combined fasta file.')
     parser.add_argument('--log_dir', default='logs', help='Directory for log files')
     parser.add_argument('--clean', action='store_true', help='Clean the concatenated fasta file (optional)')
+    parser.add_argument('--no-unicode', action='store_true', help='Disable adding unicodes to fasta headers')
     parser.add_argument('--max_workers', type=int, 
-                        default=max(1, os.cpu_count() - 1), 
+                        default=max(1, (os.cpu_count() or 1) - 1), 
                         help='Maximum number of concurrent workers (default: number of CPUs - 1)')
 
     args = parser.parse_args()
@@ -104,6 +162,11 @@ def main():
     # Resolve full path for output file
     output_file_path = Path(args.output_file).resolve()
     log_message(f"Output file will be saved to: {output_file_path}", logging.INFO)
+    
+    # Generate unicode mappings if not disabled
+    file_unicode_mappings = []
+    if not args.no_unicode:
+        file_unicode_mappings = generate_file_unicode_mapping(all_files)
     
     # Log summary of files to process
     log_message(f"Found {len(all_files)} FASTA files to process:", logging.INFO)
@@ -128,6 +191,11 @@ def main():
                 try:
                     _, content = future.result()
                     if content:  # Only add non-empty content
+                        # Add unicode to headers if not disabled
+                        if not args.no_unicode:
+                            unicode_mapping = next((m['unicode'] for m in file_unicode_mappings if m['path'] == str(file)), '')
+                            content = add_unicode_to_fasta_headers(content, unicode_mapping)
+                        
                         combined_content.append(content.strip())
                         successful_files += 1
                     else:
@@ -147,6 +215,17 @@ def main():
     with open(output_file_path, 'w') as f:
         f.write('\n'.join(combined_content))
         log_message(f'Successfully wrote combined sequences to {output_file_path}', logging.INFO)
+
+    # Export unicode-file link CSV if unicodes were generated
+    if file_unicode_mappings and not args.no_unicode:
+        csv_path = output_file_path.parent / 'unicode_file_link.csv'
+        with open(csv_path, 'w', newline='') as csvfile:
+            fieldnames = ['unicode', 'path']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for mapping in file_unicode_mappings:
+                writer.writerow(mapping)
+        log_message(f'Exported unicode-file link to {csv_path}', logging.INFO)
 
     # Final logging and summary
     log_message(f"Total files processed: {len(all_files)}", logging.INFO)
