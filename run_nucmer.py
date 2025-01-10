@@ -106,7 +106,7 @@ def run_nucmer_alignment(
         coord_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate unique prefix based on input files
-        prefix = f"{Path(ref).stem}_vs_{Path(query).stem}"
+        prefix = f"{Path(query).stem}_vs_{Path(ref).stem}"
         
         # Paths for output files
         out_delta_orig = delta_orig_dir / prefix
@@ -116,8 +116,8 @@ def run_nucmer_alignment(
         # NUCmer alignment
         nucmer_cmd = [
             'nucmer', 
-            ref, 
             query, 
+            ref, 
             '-p', str(out_delta_orig), 
             '-t', '1'
         ]
