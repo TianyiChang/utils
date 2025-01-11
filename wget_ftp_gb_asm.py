@@ -146,6 +146,7 @@ def main():
     parser.add_argument('--logdir', dest='logdir', required=True, help='Directory for logs and checkpoints')
     parser.add_argument('-t', dest='threads', type=int, default=4, help='Number of parallel workers (default: 4)')
     parser.add_argument('-d', dest='decompress', action='store_true', help='Decompress .gz files')
+    parser.add_argument('--full_path', dest='full_path', action='store_true', help='Provided paths are: /path/to/sequence.fna.gz')
     
     args = parser.parse_args()
 
@@ -154,6 +155,7 @@ def main():
     logdir = args.logdir
     max_workers = args.threads
     decompress = args.decompress
+    full_path = args.full_path
 
     # Create directories if they don't exist
     os.makedirs(outdir, exist_ok=True)
@@ -180,14 +182,18 @@ def main():
     log_message(f"  Output directory: {args.outdir}")
     log_message(f"  Log directory: {args.logdir}")
     log_message(f"  Parallel workers: {args.threads}")
-    log_message(f"  Decompress files: {args.decompress}\n")
+    log_message(f"  Decompress files: {args.decompress}")
+    log_message(f"  Use full path: {args.full_path}\n")
     
     # Read FTP base paths and generate full paths
     with open(ftp_list, 'r') as f:
         ftp_paths = [line.strip() for line in f if line.strip()]
     
-    # Generate full paths with the specified pattern
-    full_paths = [f"{ftp_path}/{re.sub(r'.*/', '', ftp_path)}_genomic.fna.gz" for ftp_path in ftp_paths]
+    # Generate full paths based on the full_path flag
+    if full_path:
+        full_paths = ftp_paths
+    else:
+        full_paths = [f"{ftp_path}/{re.sub(r'.*/', '', ftp_path)}_genomic.fna.gz" for ftp_path in ftp_paths]
     
     # Load previous checkpoint
     checkpoint_file = os.path.join(logdir, 'latest_checkpoint.json')
@@ -199,7 +205,7 @@ def main():
         if path not in checkpoint_data['jobs'] or 
            checkpoint_data['jobs'][path].get('status') != 'success'
     ]
-    
+
     log_message(f"Total paths: {len(full_paths)}, Pending downloads: {len(pending_paths)}")
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
