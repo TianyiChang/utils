@@ -7,9 +7,11 @@ import time
 import argparse
 import subprocess
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from log_utils import setup_logging, log_message
+
 
 def read_accessions(input_source):
     """
@@ -38,31 +40,82 @@ def read_accessions(input_source):
         # Assume space-separated input
         return input_source.split()
 
-def get_assembly_accession(nuccore_acc, max_retries=3):
+
+def get_assembly_accession(nuccore_acc, max_retries=2):
     """
-    Convert a nuccore accession to its corresponding assembly accession.
+    Convert a nuccore accession to its assembly information.
     
     Args:
         nuccore_acc (str): Nuccore accession number
         max_retries (int): Maximum number of retry attempts
     
     Returns:
-        tuple: (nuccore_acc, assembly_acc) or (nuccore_acc, None)
+        tuple: (asm_acc, asm_name, asm_species_taxid, asm_ftp_path) or (None, None, None, None)
     """
     for attempt in range(max_retries):
         try:
-            # Use a more robust command with error handling
-            cmd = f'esearch -db nuccore -query "{nuccore_acc}" | elink -target assembly | esummary | xtract -pattern DocumentSummary -element AssemblyAccession'
+            # Get all available information
+            cmd = f'esearch -db nuccore -query "{nuccore_acc}" | elink -target assembly | esummary | xtract -pattern DocumentSummary -element "*"'
             
             # Run the command with timeout and error handling
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
             
             if result.returncode == 0:
-                assembly_acc = result.stdout.strip()
-                if assembly_acc:
-                    return (nuccore_acc, assembly_acc)
-                else:
-                    log_message(f"No assembly accession found for {nuccore_acc}", logging.WARNING)
+                # Extract all possible elements
+                output = result.stdout.strip()
+                
+                # Attempt to find AssemblyAccession
+                asm_acc_match = re.findall(r'<AssemblyAccession>(.*?)</AssemblyAccession>', output)
+                asm_acc = asm_acc_match[0] if asm_acc_match else None
+                
+                # Attempt to find AssemblyName
+                asm_name_match = re.findall(r'<AssemblyName>(.*?)</AssemblyName>', output)
+                asm_name = asm_name_match[0] if asm_name_match else None
+                
+                # Attempt to find SpeciesTaxid
+                species_taxid_match = re.findall(r'<SpeciesTaxid>(.*?)</SpeciesTaxid>', output)
+                asm_species_taxid = species_taxid_match[0] if species_taxid_match else None
+                
+                # Attempt to find FtpPath_RefSeq
+                ftp_path_match = re.findall(r'<FtpPath_RefSeq>(.*?)</FtpPath_RefSeq>', output)
+                asm_ftp_path = ftp_path_match[0] if ftp_path_match else None
+                
+                # Log warnings for missing information
+                if not asm_acc:
+                    log_message(f"Warning: No valid AssemblyAccession found for {nuccore_acc}", logging.WARNING)
+                
+                if not asm_name:
+                    log_message(f"Warning: No valid AssemblyName found for {nuccore_acc}", logging.WARNING)
+
+                if not asm_species_taxid:
+                    log_message(f"Warning: No valid SpeciesTaxid found for {nuccore_acc}", logging.WARNING)
+                
+                if not asm_ftp_path:
+                    log_message(f"Warning: No valid FtpPath_RefSeq found for {nuccore_acc}", logging.WARNING)
+                
+                # Generate FTP path if not already found and both asm_acc and asm_name are present
+                if not asm_ftp_path and asm_acc and asm_name:
+                    try:
+                        # Extract components from assembly accession
+                        prefix = re.match(r'([^_]+)', asm_acc).group(1)
+                        level1 = re.search(r'_(\d{3})', asm_acc).group(1)
+                        level2 = re.search(r'_\d{3}(\d{3})', asm_acc).group(1)
+                        level3 = re.search(r'_\d{6}(\d{3})', asm_acc).group(1)
+                        
+                        # Construct FTP path
+                        asm_ftp_path = '/'.join([
+                            'ftp://ftp.ncbi.nlm.nih.gov/genomes/all',
+                            prefix,
+                            level1,
+                            level2,
+                            level3,
+                            f"{asm_acc}_{asm_name}"
+                        ])
+                    
+                    except (AttributeError, IndexError) as e:
+                        log_message(f"Failed to generate FTP path for {nuccore_acc}: {e}", logging.WARNING)
+                
+                return (asm_acc, asm_name, asm_species_taxid, asm_ftp_path)
             else:
                 log_message(f"Command failed for {nuccore_acc}: {result.stderr}", logging.ERROR)
             
@@ -77,11 +130,12 @@ def get_assembly_accession(nuccore_acc, max_retries=3):
         # Brief pause between retries to avoid overwhelming NCBI servers
         time.sleep(1)
     
-    log_message(f"Failed to get assembly accession for {nuccore_acc} after {max_retries} attempts", logging.ERROR)
-    return (nuccore_acc, None)
+    log_message(f"Failed to get assembly information for {nuccore_acc} after {max_retries} attempts", logging.ERROR)
+    return (None, None, None, None)
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert Nuccore Accessions to Assembly Accessions')
+    parser = argparse.ArgumentParser(description='Convert Nuccore Accessions to Assembly Information')
     parser.add_argument('input', help='Space-separated list of accessions or path to CSV with "nt_acc" column')
     parser.add_argument('output', help='Path to output CSV file')
     parser.add_argument('log_dir', help='Directory for log files')
@@ -98,7 +152,7 @@ def main():
     
     # Process accessions with concurrent processing and progress bar
     results = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         # Submit all jobs
         futures = {executor.submit(get_assembly_accession, acc): acc for acc in nuccore_accs}
         
@@ -107,16 +161,30 @@ def main():
                            total=len(futures), 
                            desc="Converting Accessions", 
                            unit="accession"):
-            nuccore_acc, asm_acc = future.result()
-            if asm_acc:
-                results.append({'nt_acc': nuccore_acc, 'asm_acc': asm_acc})
-            else:
-                log_message(f"Skipping {nuccore_acc} due to no assembly accession", logging.WARNING)
+            asm_acc, asm_name, asm_species_taxid, asm_ftp_path = future.result()
+            
+            # Only add results with both asm_acc and asm_name
+            if asm_acc and asm_name and asm_ftp_path:
+                result_entry = {
+                    'asm_acc': asm_acc, 
+                    'asm_name': asm_name,
+                    'asm_ftp_path': asm_ftp_path
+                }
+                
+                # Add species_taxid if it exists
+                if asm_species_taxid:
+                    result_entry['asm_species_taxid'] = asm_species_taxid
+                
+                results.append(result_entry)
     
     # Write results to CSV
     try:
         with open(args.output, 'w', newline='') as csvfile:
-            fieldnames = ['nt_acc', 'asm_acc']
+            # Dynamically create fieldnames
+            fieldnames = ['asm_acc', 'asm_name', 'asm_ftp_path']
+            if any('asm_species_taxid' in result for result in results):
+                fieldnames.append('asm_species_taxid')
+            
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(results)
