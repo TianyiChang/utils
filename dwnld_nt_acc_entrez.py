@@ -36,6 +36,7 @@ Dependencies:
 Note: Requires Entrez command-line tools to be installed and configured.
 """
 
+import logging
 import os
 import re
 import pandas as pd
@@ -110,7 +111,7 @@ def read_accessions(input_source: Union[str, List[str]]) -> Set[str]:
                 else:
                     raise ValueError(f"Unsupported file type: {file_ext}")
             except Exception as e:
-                log_message(f"Error reading file {input_source}: {e}", level='error')
+                log_message(f"Error reading file {input_source}: {e}", level=logging.ERROR)
                 return set()
         else:
             # Treat as space-separated string of accessions
@@ -164,7 +165,7 @@ def download_sequence(accession: str, output_folder: str) -> bool:
         # Remove the file if an exception occurs
         if os.path.exists(output_file):
             os.remove(output_file)
-        log_message(f"Error downloading {accession}: {e}", level='error')
+        log_message(f"Error downloading {accession}: {e}", level=logging.ERROR)
         return False
 
 def main():

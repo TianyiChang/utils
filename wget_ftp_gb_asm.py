@@ -26,16 +26,12 @@ Dependencies:
 """
 
 import os
-import sys
 import re
 import json
 import argparse
 import subprocess
 import logging
-import shutil
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any
 
 # Import logging utilities from log_utils
 from log_utils import setup_logging, log_message
@@ -44,228 +40,299 @@ from log_utils import setup_logging, log_message
 from tqdm import tqdm
 
 
-def load_previous_checkpoint(checkpoint_file: str) -> Dict[str, Any]:
+def load_checkpoint(checkpoint_file):
     """
-    Load previous checkpoint if exists, otherwise return empty checkpoint data.
-    
-    Handles potential file reading and JSON decoding errors gracefully.
+    Load checkpoint data from a JSON file.
     
     Args:
-        checkpoint_file (str): Path to the checkpoint file
+        checkpoint_file (str): Path to the checkpoint JSON file
     
     Returns:
-        Dict[str, Any]: Checkpoint data with 'total_jobs' and 'jobs' keys
+        dict: Checkpoint data with 'total_jobs' and 'jobs' keys
     """
     try:
         if os.path.exists(checkpoint_file):
             with open(checkpoint_file, 'r') as f:
                 return json.load(f)
-    except (IOError, json.JSONDecodeError):
-        pass
-    
-    return {'total_jobs': 0, 'jobs': {}}
+        else:
+            # Return default checkpoint structure if file doesn't exist
+            return {'total_jobs': 0, 'jobs': {}}
+    except (json.JSONDecodeError, IOError):
+        # Handle potential file reading or parsing errors
+        log_message(f"Error reading checkpoint file: {checkpoint_file}", level=logging.ERROR)
+        return {'total_jobs': 0, 'jobs': {}}
 
 
-def download_file(ftp_path: str, checkpoint_dir: str, decompress: bool = False) -> Dict[str, str]:
+def save_checkpoint(checkpoint_file, checkpoint_data):
     """
-    Download a file using wget and optionally decompress it using pigz.
+    Save checkpoint data to a JSON file.
     
-    Supports downloading files from FTP sources with optional decompression.
-    Provides detailed error tracking and status reporting.
+    Args:
+        checkpoint_file (str): Path to save the checkpoint JSON file
+        checkpoint_data (dict): Checkpoint data to save
+    """
+    try:
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+        
+        # Write checkpoint data
+        with open(checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f, indent=2)
+        
+        log_message(f"Checkpoint saved to {checkpoint_file}")
+    except Exception as e:
+        log_message(f"Error saving checkpoint: {e}", logging.ERROR)
+
+
+def determine_pending_jobs(full_paths, checkpoint_data, decompress):
+    """
+    Determine which jobs need to be processed based on checkpoint and decompress flag
+    
+    Args:
+        full_paths (list): List of full FTP paths
+        checkpoint_data (dict): Existing checkpoint data
+        decompress (bool): Whether decompression is requested
+    
+    Returns:
+        list: Paths that need to be processed
+    """
+    pending_paths = []
+    
+    for path in full_paths:
+        # If path not in checkpoint, needs processing
+        if path not in checkpoint_data['jobs']:
+            pending_paths.append(path)
+            continue
+        
+        job_status = checkpoint_data['jobs'][path].get('status')
+        
+        if decompress:
+            # For decompress mode, check decompress status
+            if job_status != 'decompress_success':
+                pending_paths.append(path)
+        else:
+            # For non-decompress mode, only check download status
+            if job_status != 'download_success':
+                pending_paths.append(path)
+    
+    return pending_paths
+
+
+def download_and_process_file(ftp_path, local_path, checkpoint_data, decompress=False, timeout=120):
+    """
+    Download and optionally decompress a file with timeout
     
     Args:
         ftp_path (str): Full FTP path to download
-        checkpoint_dir (str): Directory to save downloaded files
-        decompress (bool, optional): Whether to decompress .gz files. Defaults to False.
+        local_path (str): Local directory to save the file
+        checkpoint_data (dict): Existing checkpoint data
+        decompress (bool): Whether to decompress .gz files
+        timeout (int): Timeout in seconds for wget download (default: 120 seconds)
     
     Returns:
-        Dict[str, str]: Download status with details including success/failure information
+        dict: Download and processing status
     """
-    filename = os.path.basename(ftp_path)
-    local_path = os.path.join(checkpoint_dir, filename)
+    # Check existing job status in checkpoint
+    existing_job = checkpoint_data['jobs'].get(ftp_path, {})
     
     try:
-        # Download file using wget
-        wget_cmd = ['wget', '-O', local_path, ftp_path]
-        result = subprocess.run(wget_cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            return {
-                'status': 'failed',
-                'ftp_path': ftp_path,
-                'error': result.stderr
-            }
-        
-        # Decompress if requested and file is .gz
-        if decompress and filename.endswith('.gz'):
-            pigz_cmd = ['pigz', '-d', local_path]
-            decomp_result = subprocess.run(pigz_cmd, capture_output=True, text=True)
+        # Determine if download is needed
+        if not existing_job or existing_job.get('status') in ['download_failed', 'decompress_failed', 'unexpected_error']:
             
-            if decomp_result.returncode != 0:
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            try:
+                # Download file using wget with timeout
+                wget_cmd = ['timeout', str(timeout), 'wget', '-O', local_path, ftp_path]
+                subprocess.run(
+                    wget_cmd, 
+                    capture_output=True, 
+                    text=True, 
+                    check=True
+                )
+            except subprocess.CalledProcessError as wget_error:
+                log_message(f"wget failed for {ftp_path}:\n{wget_error.stderr}", level=logging.ERROR)
                 return {
-                    'status': 'decompress_failed',
+                    'status': 'download_failed',
                     'ftp_path': ftp_path,
-                    'error': decomp_result.stderr
+                    'error': f"wget failed with return code {wget_error.returncode}: {wget_error.stderr}"
+                }
+            except subprocess.TimeoutExpired:
+                log_message(f"Download timed out after {timeout} seconds for {ftp_path}", level=logging.ERROR)
+                return {
+                    'status': 'download_failed',
+                    'ftp_path': ftp_path,
+                    'error': f'Download timed out after {timeout} seconds'
                 }
             
-            # Update local_path to decompressed file
-            local_path = local_path.rstrip('.gz')
+            # Verify download
+            if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+                log_message(f"Download failed or empty file for {ftp_path}", level=logging.ERROR)
+                return {
+                    'status': 'download_failed',
+                    'ftp_path': ftp_path,
+                    'error': f'Download failed or empty file for {ftp_path}'
+                }
+            
+            # Successful download
+            job_result = {
+                'status': 'download_success',
+                'ftp_path': ftp_path,
+                'local_path': local_path
+            }
+        else:
+            # Use existing local path from previous checkpoint
+            job_result = existing_job
+            local_path = job_result.get('local_path', os.path.join(local_path, os.path.basename(ftp_path)))
         
-        return {
-            'status': 'success',
-            'ftp_path': ftp_path,
-            'local_path': local_path
-        }
+        # Handle decompression if requested
+        if decompress and local_path.endswith('.gz'):
+            decompressed_path = local_path.rstrip('.gz')
+            
+            # Only decompress if not already successfully decompressed
+            if existing_job.get('status') != 'decompress_success':
+                try:
+                    # Decompress, overwriting if partial
+                    pigz_cmd = ['pigz', '-d', '-f', local_path]
+                    subprocess.run(pigz_cmd, check=True, capture_output=True, text=True)
+                    
+                    # Update result for successful decompression
+                    job_result.update({
+                        'status': 'decompress_success',
+                        'local_path': decompressed_path
+                    })
+                
+                except subprocess.CalledProcessError as decomp_error:
+                    log_message(f"Decompression failed for {ftp_path}:\n{decomp_error}", level=logging.ERROR)
+                    job_result = {
+                        'status': 'decompress_failed',
+                        'ftp_path': ftp_path,
+                        'error': f'Decompression failed for {ftp_path}'
+                    }
+            else:
+                # Already successfully decompressed
+                job_result['local_path'] = decompressed_path
+        
+        return job_result
     
-    except Exception as e:
+    except subprocess.CalledProcessError as download_error:
+        log_message(f"Download failed for {ftp_path}: {download_error}", level=logging.ERROR)
         return {
-            'status': 'failed',
+            'status': 'download_failed',
+            'ftp_path': ftp_path,
+            'error': str(download_error)
+        }
+    except Exception as e:
+        log_message(f"Unexpected error for {ftp_path}: {e}", level=logging.ERROR)
+        return {
+            'status': 'unexpected_error',
             'ftp_path': ftp_path,
             'error': str(e)
         }
 
 
 def main():
-    """
-    Main function to orchestrate parallel FTP genome downloads.
-    
-    Handles argument parsing, setup of download environment, 
-    parallel download processing, and result tracking.
-    
-    Workflow:
-    1. Parse command-line arguments
-    2. Setup logging and checkpoint directories
-    3. Generate download paths
-    4. Execute parallel downloads
-    5. Track and log download progress
-    6. Generate download summary
-    """
-    parser = argparse.ArgumentParser(description='Download files via FTP with parallel processing')
-    parser.add_argument('-i', dest='ftp_list', required=True, help='Path to file with FTP base paths')
-    parser.add_argument('-o', dest='outdir', required=True, help='Output directory for final files')
+    parser = argparse.ArgumentParser(description='Download genomic sequences from FTP paths')
+    parser.add_argument('ftp_list', help='File containing FTP paths')
+    parser.add_argument('outdir', help='Output directory for downloaded files')
     parser.add_argument('--logdir', dest='logdir', required=True, help='Directory for logs and checkpoints')
     parser.add_argument('-t', dest='threads', type=int, default=4, help='Number of parallel workers (default: 4)')
     parser.add_argument('-d', dest='decompress', action='store_true', help='Decompress .gz files')
-    parser.add_argument('--full_path', dest='full_path', action='store_true', help='Provided paths are: /path/to/sequence.fna.gz')
     
     args = parser.parse_args()
-
-    ftp_list = args.ftp_list
+    
+    # Setup directories and logging
     outdir = args.outdir
     logdir = args.logdir
     max_workers = args.threads
     decompress = args.decompress
-    full_path = args.full_path
 
     # Create directories if they don't exist
     os.makedirs(outdir, exist_ok=True)
     os.makedirs(logdir, exist_ok=True)
 
-    # Clean up previous checkpoint directories
-    for folder in os.listdir(logdir):
-        if folder.startswith('checkpoint_'):
-            shutil.rmtree(os.path.join(logdir, folder))
-            
-    # Create timestamped checkpoint directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = os.path.join(logdir, f'checkpoint_{timestamp}')
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
     # Setup logging
-    setup_logging(logdir)
-    log_message(f"Process started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-    # Log the command-line arguments
-    log_message(f"Command-line arguments: {' '.join(sys.argv)}\n")
-    log_message(f"Parsed arguments:")
+    log_file = setup_logging(logdir)
+    log_message(f"Log file created at: {log_file}")
+    
+    # Log input parameters
     log_message(f"  Input FTP list: {args.ftp_list}")
     log_message(f"  Output directory: {args.outdir}")
     log_message(f"  Log directory: {args.logdir}")
     log_message(f"  Parallel workers: {args.threads}")
-    log_message(f"  Decompress files: {args.decompress}")
-    log_message(f"  Use full path: {args.full_path}\n")
+    log_message(f"  Decompress files: {args.decompress}\n")
+        
+    # Checkpoint file management
+    checkpoint_file = os.path.join(logdir, 'latest_checkpoint.json')
+    checkpoint_data = load_checkpoint(checkpoint_file)
     
     # Read FTP base paths and generate full paths
-    with open(ftp_list, 'r') as f:
+    with open(args.ftp_list, 'r') as f:
         ftp_paths = [line.strip() for line in f if line.strip()]
     
-    # Generate full paths based on the full_path flag
-    if full_path:
-        full_paths = ftp_paths
-    else:
-        full_paths = [f"{ftp_path}/{re.sub(r'.*/', '', ftp_path)}_genomic.fna.gz" for ftp_path in ftp_paths]
+    # Generate full paths with the specified pattern
+    full_paths = [f"{ftp_path}/{re.sub(r'.*/', '', ftp_path)}_genomic.fna.gz" for ftp_path in ftp_paths]
     
-    # Load previous checkpoint
-    checkpoint_file = os.path.join(logdir, 'latest_checkpoint.json')
-    checkpoint_data = load_previous_checkpoint(checkpoint_file)
+    # Determine pending paths based on checkpoint and decompress flag
+    pending_paths = determine_pending_jobs(full_paths, checkpoint_data, decompress)
     
-    # Filter out already downloaded paths
-    pending_paths = [
-        path for path in full_paths 
-        if path not in checkpoint_data['jobs'] or 
-           checkpoint_data['jobs'][path].get('status') != 'success'
-    ]
-
-    log_message(f"Total paths: {len(full_paths)}, Pending downloads: {len(pending_paths)}")
+    # Track successful downloads and decompressions
+    successful_downloads = 0
+    successful_decompressions = 0
     
+    # Create progress bar
+    progress_bar = tqdm(total=len(pending_paths), 
+                        desc="Processing Files", 
+                        unit="file")
+    
+    # Concurrent download and processing
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        with tqdm(total=len(pending_paths), desc='Downloading Genomes', unit='file') as pbar:
-            futures = {
-                executor.submit(download_file, path, checkpoint_dir, decompress): path 
-                for path in pending_paths
-            }
+        # Prepare futures
+        futures = {
+            executor.submit(download_and_process_file, 
+                            path, 
+                            os.path.join(outdir, os.path.basename(path)), 
+                            checkpoint_data, 
+                            decompress): path 
+            for path in pending_paths
+        }
+        
+        # Process results
+        for future in as_completed(futures):
+            result = future.result()
             
-            for future in as_completed(futures):
-                ftp_path = futures[future]
-                try:
-                    result = future.result()
-                    checkpoint_data['jobs'][ftp_path] = result
-                    
-                    # Update checkpoint file in real-time
-                    with open(checkpoint_file, 'w') as f:
-                        json.dump(checkpoint_data, f, indent=2)
-                    
-                    if result['status'] == 'success':
-                        # Move file immediately after successful download
-                        local_file = result['local_path']
-                        dest_file = os.path.join(outdir, os.path.basename(local_file))
-                        os.rename(local_file, dest_file)
-                        
-                        log_message(f"Successfully downloaded and moved: {ftp_path}")
-                        pbar.update(1)
-                    else:
-                        log_message(f"Failed to download: {ftp_path}. Error: {result.get('error', 'Unknown error')}", level=logging.ERROR)
-                        pbar.update(1)
-                
-                except Exception as e:
-                    log_message(f"Unexpected error downloading {ftp_path}: {e}", level=logging.ERROR)
-                    pbar.update(1)
-
-    # Clean up checkpoint directories
-    for folder in os.listdir(logdir):
-        if folder.startswith('checkpoint_'):
-            shutil.rmtree(os.path.join(logdir, folder))
+            # Update checkpoint
+            checkpoint_data['jobs'][result['ftp_path']] = result
             
-    # Prepare summary of jobs
-    successful_jobs = [
-        job for job, details in checkpoint_data['jobs'].items() 
-        if details['status'] == 'success'
-    ]
-    failed_jobs = [
-        job for job, details in checkpoint_data['jobs'].items() 
-        if details['status'] != 'success'
-    ]
+            # Save checkpoint in real-time
+            try:
+                with open(checkpoint_file, 'w') as f:
+                    json.dump(checkpoint_data, f, indent=2)
+            except Exception as e:
+                log_message(f"Error saving real-time checkpoint: {e}", level=logging.ERROR)
+            
+            # Count successes
+            if result['status'] == 'download_success':
+                successful_downloads += 1
+            elif result['status'] == 'decompress_success':
+                successful_downloads += 1
+                successful_decompressions += 1
+            
+            # Update progress bar
+            progress_bar.update(1)
+        
+        # Close progress bar
+        progress_bar.close()
     
     # Log summary
-    summary_message = [
-        "Download Process Summary:",
-        f"Total Jobs: {len(full_paths)}",
-        f"Successful Downloads: {len(successful_jobs)}",
-        f"Failed Downloads: {len(failed_jobs)}"
-    ]
-    log_message('\n'.join(summary_message))
-
-
-if __name__ == '__main__':
-    main()
+    log_message(f"Total paths: {len(full_paths)}")
+    log_message(f"Pending paths: {len(pending_paths)}")
+    log_message(f"Successful downloads: {successful_downloads}")
+    log_message(f"Successful decompressions: {successful_decompressions}")
     
+    # Final checkpoint save (optional, but ensures final state is saved)
+    save_checkpoint(checkpoint_file, checkpoint_data)
+
+if __name__ == "__main__":
+    main()
