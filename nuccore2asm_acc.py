@@ -41,7 +41,7 @@ def read_accessions(input_source):
         return input_source.split()
 
 
-def get_assembly_accession(nuccore_acc, max_retries=2):
+def get_assembly_accession(nuccore_acc, max_retries=3):
     """
     Convert a nuccore accession to its assembly information.
     
@@ -152,42 +152,61 @@ def main():
     
     # Process accessions with concurrent processing and progress bar
     results = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        # Submit all jobs
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Create futures for all jobs
         futures = {executor.submit(get_assembly_accession, acc): acc for acc in nuccore_accs}
         
+        # Create tqdm progress bar
+        progress_bar = tqdm(total=len(futures), 
+                            desc="Converting Accessions", 
+                            unit="accession")
+        
         # Process results as they complete
-        for future in tqdm(as_completed(futures), 
-                           total=len(futures), 
-                           desc="Converting Accessions", 
-                           unit="accession"):
-            asm_acc, asm_name, asm_species_taxid, asm_ftp_path = future.result()
+        for future in as_completed(futures):
+            try:
+                asm_acc, asm_name, asm_species_taxid, asm_ftp_path = future.result()
+                
+                # Only add results with ftp_path
+                if asm_ftp_path:
+                    result_entry = {
+                        'nt_acc': futures[future],
+                        'asm_acc': asm_acc if asm_acc is not None else '',
+                        'asm_name': asm_name if asm_name is not None else '',
+                        'asm_ftp_path': asm_ftp_path,
+                        'asm_species_taxid': asm_species_taxid if asm_species_taxid is not None else ''
+                    }
+                    
+                    results.append(result_entry)
+                
+                # Update progress bar
+                progress_bar.update(1)
             
-            # Only add results with both asm_acc and asm_name
-            if asm_acc and asm_name and asm_ftp_path:
-                result_entry = {
-                    'asm_acc': asm_acc, 
-                    'asm_name': asm_name,
-                    'asm_ftp_path': asm_ftp_path
-                }
-                
-                # Add species_taxid if it exists
-                if asm_species_taxid:
-                    result_entry['asm_species_taxid'] = asm_species_taxid
-                
-                results.append(result_entry)
-    
-    # Write results to CSV
+            except Exception as e:
+                log_message(f"Error processing future: {e}", logging.ERROR)
+                progress_bar.update(1)
+        
+        # Close the progress bar
+        progress_bar.close()
+        
+    # Write results to TSV
     try:
-        with open(args.output, 'w', newline='') as csvfile:
+        with open(args.output, 'w', newline='') as tsvfile:
             # Dynamically create fieldnames
-            fieldnames = ['asm_acc', 'asm_name', 'asm_ftp_path']
+            fieldnames = ['nt_acc', 'asm_acc', 'asm_name', 'asm_ftp_path']
             if any('asm_species_taxid' in result for result in results):
                 fieldnames.append('asm_species_taxid')
             
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
+            # Use csv writer with tab delimiter
+            writer = csv.writer(tsvfile, delimiter='\t')
+            
+            # Write header
+            writer.writerow(fieldnames)
+            
+            # Write data rows
+            for result in results:
+                # Ensure consistent order of fields
+                row = [result.get(field, '') for field in fieldnames]
+                writer.writerow(row)
         
         log_message(f"Converted {len(results)} accessions. Output saved to {args.output}")
     
